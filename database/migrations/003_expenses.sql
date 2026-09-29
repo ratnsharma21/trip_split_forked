@@ -1,0 +1,1 @@
+CREATE TABLE expenses (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE, payer_id UUID NOT NULL REFERENCES travelers(id) ON DELETE RESTRICT, title TEXT NOT NULL DEFAULT 'Trip expense', amount NUMERIC(12,2) NOT NULL CHECK (amount > 0), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());

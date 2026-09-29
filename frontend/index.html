@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TripSplit - Expense Splitter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar"><div class="brand"><span class="logo">₹</span><div><strong>TripSplit</strong><small>Live shared travel expenses</small></div></div><div class="top-actions"><span id="liveStatus" class="status">● Live · Synced</span><button id="historyBtn" class="secondary">Trip history</button><button id="resetBtn" class="secondary">New trip</button></div></header>
+<section id="welcome" class="welcome"><span class="overline accent-label">SHARED TRIP WALLET</span><h1>One trip. <span>Everyone's phone.</span></h1><p>One person can add an expense from their phone while another person adds theirs from another phone. The same trip updates automatically for everyone.</p><div class="welcome-actions"><button id="createBtn" class="primary">Create new trip</button><button id="joinBtn" class="secondary">Join existing trip</button></div><div id="createBox" class="welcome-form hidden"><label>Trip name<input id="newTripName" value="GOA 2026" placeholder="GOA 2026"></label><label>Number of people<input id="peopleCount" type="number" min="1" max="20" value="5"></label><button id="startTrip" class="primary">Start trip</button></div><div id="joinBox" class="welcome-form hidden"><label>Trip code<input id="joinCode" maxlength="6" placeholder="DE1DVF"></label><button id="joinTrip" class="primary">Join trip</button></div></section>
+<main id="app" class="container hidden">
+<section class="trip-card"><div><span class="overline">CURRENT TRIP</span><h1 id="tripName">My Trip</h1><p id="tripMeta">4 people - Last updated just now</p></div><div class="share"><span class="overline">SHARE THIS CODE</span><strong id="shareCode">------</strong><button id="copyBtn" class="secondary">Copy join link</button></div></section>
+<div class="grid"><section class="panel setup"><div class="panel-head"><div><h2>1. Travelers</h2><p>Everyone in this trip sees these names.</p></div><span class="step">01</span></div><div id="peopleList" class="people-list"></div><button id="buildPeople" class="wide-button">Save traveler names</button></section><section class="panel expense"><div class="panel-head"><div><h2>2. Add expense</h2><p>Saved instantly and shared with everyone.</p></div><span class="step">02</span></div><div class="expense-form"><label>Who paid<select id="payer"></select></label><label>Expense title<input id="title" placeholder="Hotel, food, fuel..."></label><label>Amount (₹)<input id="amount" type="number" min="0" step="0.01" placeholder="0.00"></label><button id="addExpense" class="primary">+ Add expense</button></div><div id="expenseList" class="expense-list empty">No expenses yet.</div></section></div>
+<section class="panel summary"><div class="panel-head"><div><h2>3. Live trip summary</h2><p>Balances update whenever anyone adds an expense.</p></div><span class="step">03</span></div><div class="stats"><div><span>Total expense</span><strong id="total">₹0.00</strong></div><div><span>Each person's share</span><strong id="share">₹0.00</strong></div><div><span>Expenses logged</span><strong id="expenseCount">0</strong></div></div><div class="results"><div><h3>Balance by person</h3><div id="balances"></div></div><div><h3>Settlement plan</h3><div id="settlements" class="settlements"></div></div></div></section>
+</main><div id="history" class="modal hidden"><div class="modal-card"><div class="modal-head"><h2>Trip history</h2><button id="closeHistory" class="close">×</button></div><div id="historyList"></div></div></div>
+<script src="app.js"></script>
+</body></html>
