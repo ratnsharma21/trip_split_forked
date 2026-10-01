@@ -1,0 +1,50 @@
+services:
+  tripsplit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tripsplit-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-3000}
+      - NODE_ENV=${NODE_ENV:-production}
+      - DB_TYPE=${DB_TYPE:-postgres}
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-tripsplit}
+      - DB_USER=${DB_USER:-tripsplit_user}
+      - DB_PASSWORD=${DB_PASSWORD:-tripsplit_secure_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - tripsplit-data:/app/data
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tripsplit-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-tripsplit_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-tripsplit_secure_password}
+      POSTGRES_DB: ${DB_NAME:-tripsplit}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-tripsplit_user} -d ${DB_NAME:-tripsplit}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  tripsplit-data:
+    driver: local
+  postgres-data:
+    driver: local

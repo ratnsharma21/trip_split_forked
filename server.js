@@ -5,55 +5,230 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import pg from "pg";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const frontend = join(root, "frontend");
 const dataDir = join(root, "data");
-if (!existsSync(dataDir)) mkdirSync(dataDir);
-const db = new DatabaseSync(join(dataDir, "tripsplit.sqlite"));
-db.exec(`
-  PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS trips (id TEXT PRIMARY KEY, name TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, share_code TEXT UNIQUE NOT NULL);
-  CREATE TABLE IF NOT EXISTS travelers (id TEXT PRIMARY KEY, trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS expenses (id TEXT PRIMARY KEY, trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE, payer_id TEXT NOT NULL REFERENCES travelers(id) ON DELETE RESTRICT, title TEXT NOT NULL, amount REAL NOT NULL CHECK (amount > 0), created_at TEXT NOT NULL);
-  CREATE INDEX IF NOT EXISTS travelers_trip_id_idx ON travelers(trip_id);
-  CREATE INDEX IF NOT EXISTS expenses_trip_id_idx ON expenses(trip_id);
-`);
+
+// Configuration from Environment Variables
+const PORT = Number(process.env.PORT || 3000);
+const DB_TYPE = (process.env.DB_TYPE || (process.env.DB_HOST ? "postgres" : "sqlite")).toLowerCase();
+const DB_HOST = process.env.DB_HOST || "localhost";
+const DB_PORT = Number(process.env.DB_PORT || 5432);
+const DB_NAME = process.env.DB_NAME || "tripsplit";
+const DB_USER = process.env.DB_USER || "tripsplit_user";
+const DB_PASSWORD = process.env.DB_PASSWORD || "tripsplit_secure_password";
+const DB_SQLITE_PATH = process.env.DB_SQLITE_PATH || join(dataDir, "tripsplit.sqlite");
+
+// Database Abstraction Layer
+let dbAdapter = null;
+
+function createSqliteAdapter() {
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  const sqlite = new DatabaseSync(DB_SQLITE_PATH);
+  sqlite.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS trips (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT 'New Trip',
+      currency TEXT NOT NULL DEFAULT 'INR',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      share_code TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS travelers (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS expenses (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      payer_id TEXT NOT NULL REFERENCES travelers(id) ON DELETE RESTRICT,
+      title TEXT NOT NULL DEFAULT 'Trip expense',
+      amount REAL NOT NULL CHECK (amount > 0),
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS travelers_trip_id_idx ON travelers(trip_id);
+    CREATE INDEX IF NOT EXISTS expenses_trip_id_idx ON expenses(trip_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS trips_share_code_idx ON trips(share_code);
+  `);
+
+  const toSqlite = (sql) => sql.replace(/\$\d+/g, "?");
+
+  return {
+    type: "sqlite",
+    async get(sql, params = []) {
+      return sqlite.prepare(toSqlite(sql)).get(...params) || null;
+    },
+    async all(sql, params = []) {
+      return sqlite.prepare(toSqlite(sql)).all(...params);
+    },
+    async run(sql, params = []) {
+      return sqlite.prepare(toSqlite(sql)).run(...params);
+    }
+  };
+}
+
+async function createPostgresAdapter() {
+  const { Pool } = pg;
+  const pool = new Pool({
+    host: DB_HOST,
+    port: DB_PORT,
+    database: DB_NAME,
+    user: DB_USER,
+    password: DB_PASSWORD,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  });
+
+  // Verify connection with retry
+  let connected = false;
+  for (let i = 0; i < 15; i++) {
+    try {
+      const client = await pool.connect();
+      client.release();
+      connected = true;
+      break;
+    } catch (err) {
+      console.log(`Waiting for PostgreSQL to be ready (attempt ${i + 1}/15)...`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+
+  if (!connected) {
+    throw new Error(`Unable to connect to PostgreSQL at ${DB_HOST}:${DB_PORT}/${DB_NAME}`);
+  }
+
+  // Ensure tables exist
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trips (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT 'New Trip',
+      currency TEXT NOT NULL DEFAULT 'INR',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      share_code TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS travelers (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS expenses (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      payer_id TEXT NOT NULL REFERENCES travelers(id) ON DELETE RESTRICT,
+      title TEXT NOT NULL DEFAULT 'Trip expense',
+      amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS travelers_trip_id_idx ON travelers(trip_id);
+    CREATE INDEX IF NOT EXISTS expenses_trip_id_idx ON expenses(trip_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS trips_share_code_idx ON trips(share_code);
+  `);
+
+  return {
+    type: "postgres",
+    async get(sql, params = []) {
+      const res = await pool.query(sql, params);
+      return res.rows[0] || null;
+    },
+    async all(sql, params = []) {
+      const res = await pool.query(sql, params);
+      return res.rows;
+    },
+    async run(sql, params = []) {
+      return await pool.query(sql, params);
+    }
+  };
+}
+
+async function initDatabase() {
+  if (DB_TYPE === "postgres") {
+    try {
+      console.log(`Connecting to PostgreSQL at ${DB_HOST}:${DB_PORT}/${DB_NAME} as ${DB_USER}...`);
+      dbAdapter = await createPostgresAdapter();
+      console.log("Connected to PostgreSQL successfully.");
+    } catch (err) {
+      console.error("PostgreSQL connection error:", err.message);
+      console.log("Falling back to local SQLite database...");
+      dbAdapter = createSqliteAdapter();
+      console.log(`Connected to SQLite fallback database at ${DB_SQLITE_PATH}`);
+    }
+  } else {
+    console.log(`Initializing SQLite database at ${DB_SQLITE_PATH}...`);
+    dbAdapter = createSqliteAdapter();
+    console.log("SQLite database initialized successfully.");
+  }
+}
 
 const json = (res, status, body) => {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(body));
 };
+
 const now = () => new Date().toISOString();
 const code = () => Math.random().toString(36).slice(2, 8).toUpperCase();
-const body = async req => {
+const body = async (req) => {
   let raw = "";
   for await (const chunk of req) raw += chunk;
   return raw ? JSON.parse(raw) : {};
 };
-const tripFor = value => db.prepare("SELECT * FROM trips WHERE id = ? OR share_code = ?").get(value, value);
 
-function tripPayload(trip) {
-  const travelers = db.prepare("SELECT id,name,position FROM travelers WHERE trip_id = ? ORDER BY position,created_at").all(trip.id);
-  const expenses = db.prepare("SELECT e.id,e.title,e.amount,e.created_at,e.payer_id,t.name AS payer_name FROM expenses e JOIN travelers t ON t.id=e.payer_id WHERE e.trip_id=? ORDER BY e.created_at,e.id").all(trip.id).map(item => ({ ...item, amount: Number(item.amount) }));
+const tripFor = async (value) => {
+  return await dbAdapter.get("SELECT * FROM trips WHERE id = $1 OR share_code = $2", [value, value]);
+};
+
+async function tripPayload(trip) {
+  const travelers = await dbAdapter.all(
+    "SELECT id, name, position FROM travelers WHERE trip_id = $1 ORDER BY position, created_at",
+    [trip.id]
+  );
+  const rawExpenses = await dbAdapter.all(
+    "SELECT e.id, e.title, e.amount, e.created_at, e.payer_id, t.name AS payer_name FROM expenses e JOIN travelers t ON t.id = e.payer_id WHERE e.trip_id = $1 ORDER BY e.created_at, e.id",
+    [trip.id]
+  );
+  const expenses = rawExpenses.map((item) => ({ ...item, amount: Number(item.amount) }));
   const total = expenses.reduce((sum, item) => sum + item.amount, 0);
   const share = travelers.length ? total / travelers.length : 0;
-  const balances = travelers.map(person => {
-    const paid = expenses.filter(item => item.payer_id === person.id).reduce((sum, item) => sum + item.amount, 0);
+  const balances = travelers.map((person) => {
+    const paid = expenses
+      .filter((item) => item.payer_id === person.id)
+      .reduce((sum, item) => sum + item.amount, 0);
     return { traveler_id: person.id, name: person.name, paid, balance: paid - share };
   });
-  const debtors = balances.filter(item => item.balance < -0.005).map(item => ({ ...item, amount: -item.balance }));
-  const creditors = balances.filter(item => item.balance > 0.005).map(item => ({ ...item, amount: item.balance }));
+  const debtors = balances.filter((item) => item.balance < -0.005).map((item) => ({ ...item, amount: -item.balance }));
+  const creditors = balances.filter((item) => item.balance > 0.005).map((item) => ({ ...item, amount: item.balance }));
   const settlements = [];
-  for (const debtor of debtors) while (debtor.amount > 0.005 && creditors.length) {
-    const creditor = creditors[0];
-    const amount = Math.min(debtor.amount, creditor.amount);
-    settlements.push({ from_name: debtor.name, to_name: creditor.name, amount: Number(amount.toFixed(2)) });
-    debtor.amount -= amount;
-    creditor.amount -= amount;
-    if (creditor.amount <= 0.005) creditors.shift();
+  for (const debtor of debtors) {
+    while (debtor.amount > 0.005 && creditors.length) {
+      const creditor = creditors[0];
+      const amount = Math.min(debtor.amount, creditor.amount);
+      settlements.push({ from_name: debtor.name, to_name: creditor.name, amount: Number(amount.toFixed(2)) });
+      debtor.amount -= amount;
+      creditor.amount -= amount;
+      if (creditor.amount <= 0.005) creditors.shift();
+    }
   }
-  return { trip, travelers, expenses, summary: { total: Number(total.toFixed(2)), equal_share: Number(share.toFixed(2)), expense_count: expenses.length, balances, settlements } };
+  return {
+    trip,
+    travelers,
+    expenses,
+    summary: {
+      total: Number(total.toFixed(2)),
+      equal_share: Number(share.toFixed(2)),
+      expense_count: expenses.length,
+      balances,
+      settlements
+    }
+  };
 }
 
 async function api(req, res, pathname) {
@@ -63,73 +238,146 @@ async function api(req, res, pathname) {
       const input = await body(req);
       const names = Array.isArray(input.travelers) ? input.travelers.slice(0, 20) : ["Person 1", "Person 2"];
       let shareCode;
-      do shareCode = code(); while (db.prepare("SELECT 1 FROM trips WHERE share_code=?").get(shareCode));
+      do {
+        shareCode = code();
+      } while (await dbAdapter.get("SELECT 1 FROM trips WHERE share_code = $1", [shareCode]));
+
       const timestamp = now();
-      const trip = { id: randomUUID(), name: String(input.name || "New Trip").trim().slice(0, 120) || "New Trip", currency: "INR", share_code: shareCode, created_at: timestamp, updated_at: timestamp };
-      db.prepare("INSERT INTO trips VALUES (?,?,?,?,?,?)").run(trip.id, trip.name, trip.currency, trip.created_at, trip.updated_at, trip.share_code);
-      const travelers = names.map((value, position) => {
-        const traveler = { id: randomUUID(), name: String(value || `Person ${position + 1}`).trim().slice(0, 80) || `Person ${position + 1}`, position };
-        db.prepare("INSERT INTO travelers VALUES (?,?,?,?,?)").run(traveler.id, trip.id, traveler.name, position, timestamp);
-        return traveler;
-      });
+      const trip = {
+        id: randomUUID(),
+        name: String(input.name || "New Trip").trim().slice(0, 120) || "New Trip",
+        currency: "INR",
+        share_code: shareCode,
+        created_at: timestamp,
+        updated_at: timestamp
+      };
+
+      await dbAdapter.run(
+        "INSERT INTO trips (id, name, currency, created_at, updated_at, share_code) VALUES ($1, $2, $3, $4, $5, $6)",
+        [trip.id, trip.name, trip.currency, trip.created_at, trip.updated_at, trip.share_code]
+      );
+
+      const travelers = [];
+      for (let position = 0; position < names.length; position++) {
+        const traveler = {
+          id: randomUUID(),
+          name: String(names[position] || `Person ${position + 1}`).trim().slice(0, 80) || `Person ${position + 1}`,
+          position
+        };
+        await dbAdapter.run(
+          "INSERT INTO travelers (id, trip_id, name, position, created_at) VALUES ($1, $2, $3, $4, $5)",
+          [traveler.id, trip.id, traveler.name, position, timestamp]
+        );
+        travelers.push(traveler);
+      }
       return json(res, 201, { trip, travelers });
     }
+
     if (req.method === "GET" && pathname === "/api/trips/history") {
-      const trips = db.prepare("SELECT t.id,t.name,t.share_code,t.created_at,t.updated_at,COUNT(e.id) AS expense_count,COALESCE(SUM(e.amount),0) AS total FROM trips t LEFT JOIN expenses e ON e.trip_id=t.id GROUP BY t.id ORDER BY t.updated_at DESC,t.created_at DESC").all().map(item => ({ ...item, expense_count: Number(item.expense_count), total: Number(item.total) }));
+      const tripsRaw = await dbAdapter.all(
+        "SELECT t.id, t.name, t.share_code, t.created_at, t.updated_at, COUNT(e.id) AS expense_count, COALESCE(SUM(e.amount), 0) AS total FROM trips t LEFT JOIN expenses e ON e.trip_id = t.id GROUP BY t.id, t.name, t.share_code, t.created_at, t.updated_at ORDER BY t.updated_at DESC, t.created_at DESC"
+      );
+      const trips = tripsRaw.map((item) => ({
+        ...item,
+        expense_count: Number(item.expense_count),
+        total: Number(item.total)
+      }));
       return json(res, 200, { trips });
     }
+
     if (parts[0] === "api" && parts[1] === "trips" && parts[2] && parts.length === 3) {
-      const trip = tripFor(decodeURIComponent(parts[2]));
+      const trip = await tripFor(decodeURIComponent(parts[2]));
       if (!trip) return json(res, 404, { error: "Trip not found." });
-      if (req.method === "DELETE") { db.prepare("DELETE FROM trips WHERE id=?").run(trip.id); return json(res, 200, { success: true }); }
-      return json(res, 200, tripPayload(trip));
+      if (req.method === "DELETE") {
+        await dbAdapter.run("DELETE FROM trips WHERE id = $1", [trip.id]);
+        return json(res, 200, { success: true });
+      }
+      return json(res, 200, await tripPayload(trip));
     }
+
     if (parts[0] === "api" && parts[1] === "trips" && parts[2] && parts[3] === "expenses" && parts.length === 4 && req.method === "POST") {
-      const trip = tripFor(decodeURIComponent(parts[2]));
+      const trip = await tripFor(decodeURIComponent(parts[2]));
       if (!trip) return json(res, 404, { error: "Trip not found." });
       const input = await body(req);
-      const payer = db.prepare("SELECT id FROM travelers WHERE id=? AND trip_id=?").get(String(input.payer_id || ""), trip.id);
+      const payer = await dbAdapter.get("SELECT id FROM travelers WHERE id = $1 AND trip_id = $2", [
+        String(input.payer_id || ""),
+        trip.id
+      ]);
       const amount = Number(input.amount);
-      if (!payer || !Number.isFinite(amount) || amount <= 0) return json(res, 400, { error: "payer_id and a positive amount are required." });
-      const expense = { id: randomUUID(), trip_id: trip.id, payer_id: payer.id, title: String(input.title || "Trip expense").trim().slice(0, 160) || "Trip expense", amount: Number(amount.toFixed(2)), created_at: now() };
-      db.prepare("INSERT INTO expenses VALUES (?,?,?,?,?,?)").run(expense.id, expense.trip_id, expense.payer_id, expense.title, expense.amount, expense.created_at);
-      db.prepare("UPDATE trips SET updated_at=? WHERE id=?").run(now(), trip.id);
+      if (!payer || !Number.isFinite(amount) || amount <= 0) {
+        return json(res, 400, { error: "payer_id and a positive amount are required." });
+      }
+      const expense = {
+        id: randomUUID(),
+        trip_id: trip.id,
+        payer_id: payer.id,
+        title: String(input.title || "Trip expense").trim().slice(0, 160) || "Trip expense",
+        amount: Number(amount.toFixed(2)),
+        created_at: now()
+      };
+      await dbAdapter.run(
+        "INSERT INTO expenses (id, trip_id, payer_id, title, amount, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        [expense.id, expense.trip_id, expense.payer_id, expense.title, expense.amount, expense.created_at]
+      );
+      await dbAdapter.run("UPDATE trips SET updated_at = $1 WHERE id = $2", [now(), trip.id]);
       return json(res, 201, { expense });
     }
+
     if (parts[0] === "api" && parts[1] === "trips" && parts[3] === "expenses" && parts.length === 5 && req.method === "DELETE") {
-      const trip = tripFor(decodeURIComponent(parts[2]));
-      if (!trip || !db.prepare("SELECT id FROM expenses WHERE id=? AND trip_id=?").get(parts[4], trip.id)) return json(res, 404, { error: "Expense not found." });
-      db.prepare("DELETE FROM expenses WHERE id=?").run(parts[4]);
-      db.prepare("UPDATE trips SET updated_at=? WHERE id=?").run(now(), trip.id);
+      const trip = await tripFor(decodeURIComponent(parts[2]));
+      if (!trip) return json(res, 404, { error: "Trip not found." });
+      const expense = await dbAdapter.get("SELECT id FROM expenses WHERE id = $1 AND trip_id = $2", [parts[4], trip.id]);
+      if (!expense) return json(res, 404, { error: "Expense not found." });
+      await dbAdapter.run("DELETE FROM expenses WHERE id = $1", [parts[4]]);
+      await dbAdapter.run("UPDATE trips SET updated_at = $1 WHERE id = $2", [now(), trip.id]);
       return json(res, 200, { success: true, deleted_expense_id: parts[4] });
     }
+
     if (parts[0] === "api" && parts[1] === "trips" && parts[3] === "travelers" && parts[4] && req.method === "PUT") {
-      const trip = tripFor(decodeURIComponent(parts[2]));
+      const trip = await tripFor(decodeURIComponent(parts[2]));
+      if (!trip) return json(res, 404, { error: "Trip not found." });
       const input = await body(req);
       const name = String(input.name || "").trim().slice(0, 80);
       if (!name) return json(res, 400, { error: "Traveler name is required." });
-      const result = db.prepare("UPDATE travelers SET name=? WHERE id=? AND trip_id=? RETURNING id,name,position").get(name, parts[4], trip?.id || "");
+      const result = await dbAdapter.get(
+        "UPDATE travelers SET name = $1 WHERE id = $2 AND trip_id = $3 RETURNING id, name, position",
+        [name, parts[4], trip.id]
+      );
       if (!result) return json(res, 404, { error: "Traveler not found." });
-      db.prepare("UPDATE trips SET updated_at=? WHERE id=?").run(now(), trip.id);
+      await dbAdapter.run("UPDATE trips SET updated_at = $1 WHERE id = $2", [now(), trip.id]);
       return json(res, 200, { traveler: result });
     }
+
     if (parts[0] === "api" && parts[1] === "trips" && parts[3] === "travelers" && parts[4] === "sync" && req.method === "POST") {
-      const trip = tripFor(decodeURIComponent(parts[2]));
+      const trip = await tripFor(decodeURIComponent(parts[2]));
       if (!trip) return json(res, 404, { error: "Trip not found." });
       const input = await body(req);
       const names = Array.isArray(input.travelers) ? input.travelers.slice(0, 20) : [];
-      const current = db.prepare("SELECT id FROM travelers WHERE trip_id=? ORDER BY position").all(trip.id);
+      const current = await dbAdapter.all("SELECT id FROM travelers WHERE trip_id = $1 ORDER BY position", [trip.id]);
       for (let index = 0; index < names.length; index++) {
         const name = String(names[index] || `Person ${index + 1}`).trim().slice(0, 80) || `Person ${index + 1}`;
-        if (current[index]) db.prepare("UPDATE travelers SET name=? WHERE id=?").run(name, current[index].id);
-        else db.prepare("INSERT INTO travelers VALUES (?,?,?,?,?)").run(randomUUID(), trip.id, name, index, now());
+        if (current[index]) {
+          await dbAdapter.run("UPDATE travelers SET name = $1 WHERE id = $2", [name, current[index].id]);
+        } else {
+          await dbAdapter.run("INSERT INTO travelers (id, trip_id, name, position, created_at) VALUES ($1, $2, $3, $4, $5)", [
+            randomUUID(),
+            trip.id,
+            name,
+            index,
+            now()
+          ]);
+        }
       }
       for (let index = names.length; index < current.length; index++) {
-        if (!db.prepare("SELECT 1 FROM expenses WHERE payer_id=?").get(current[index].id)) db.prepare("DELETE FROM travelers WHERE id=?").run(current[index].id);
+        const hasExpense = await dbAdapter.get("SELECT 1 FROM expenses WHERE payer_id = $1", [current[index].id]);
+        if (!hasExpense) {
+          await dbAdapter.run("DELETE FROM travelers WHERE id = $1", [current[index].id]);
+        }
       }
-      db.prepare("UPDATE trips SET updated_at=? WHERE id=?").run(now(), trip.id);
+      await dbAdapter.run("UPDATE trips SET updated_at = $1 WHERE id = $2", [now(), trip.id]);
       return json(res, 200, { success: true });
     }
+
     return json(res, 404, { error: "Not found." });
   } catch (error) {
     console.error(error);
@@ -147,5 +395,7 @@ const server = createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": mime[extname(file)] || "application/octet-stream" });
   res.end(await readFile(file));
 });
-const port = Number(process.env.PORT || 3000);
-server.listen(port, () => console.log(`TripSplit running at http://localhost:${port}`));
+
+// Start Database & Server
+await initDatabase();
+server.listen(PORT, () => console.log(`TripSplit running at http://localhost:${PORT}`));

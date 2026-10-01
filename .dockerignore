@@ -1,0 +1,10 @@
+.git
+.gitignore
+.agents
+.gemini
+.env
+.env.*
+node_modules
+npm-debug.log
+data/
+*.sqlite
